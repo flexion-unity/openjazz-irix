@@ -14,6 +14,9 @@
 #include "sndfile.h"
 
 //#define PSM_LOG
+#ifdef PSM_LOG
+#define Log printf
+#endif 
 
 #define PSM_ID_NEW	0x204d5350
 #define PSM_ID_OLD	0xfe4d5350
@@ -93,7 +96,388 @@ static void swap_PSMSAMPLE(PSMSAMPLE* p){
 	p->loopend = bswapLE32(p->loopend);
 	p->samplerate = bswapLE32(p->samplerate);
 }
+#if defined(__sgi)
+// ---------------------------------------------------------------------------
+// Safe little-endian read helpers.
+// Read byte-by-byte from the raw stream — alignment-safe on MIPS/IRIX,
+// and always produce the correct host-native value regardless of endianness.
+// ---------------------------------------------------------------------------
+static inline DWORD LE32(const BYTE *p)
+{
+    return ((DWORD)p[0])
+         | ((DWORD)p[1] <<  8)
+         | ((DWORD)p[2] << 16)
+         | ((DWORD)p[3] << 24);
+}
+static inline WORD LE16(const BYTE *p)
+{
+    return (WORD)(p[0] | (p[1] << 8));
+}
+#define PSMCHUNK_id(p)     LE32((p) + 0)
+#define PSMCHUNK_len(p)    LE32((p) + 4)
+#define PSMCHUNK_listid(p) LE32((p) + 8)
 
+#define PSMSONGHDR_CHANNELS_OFFSET 8
+#define PSMSONGHDR_channels(p) ((p)[PSMSONGHDR_CHANNELS_OFFSET])
+#define PSMPATTERN_size(p)      LE32((p) + 0)
+#define PSMPATTERN_name(p)      LE32((p) + 4)
+#define PSMPATTERN_rows(p)      LE16((p) + 8)
+#define PSMPATTERN_reserved1(p) LE16((p) + 10)
+#define PSMPATTERN_data(p)      ((p) + 12)
+
+#define PSMSAMPLE_flags(p)      ((p)[0x00])
+#define PSMSAMPLE_samplename(p) ((const char *)((p) + 0x0D))
+#define PSMSAMPLE_length(p)     LE32((p) + 0x36)
+#define PSMSAMPLE_loopstart(p)  LE32((p) + 0x3A)
+#define PSMSAMPLE_loopend(p)    LE32((p) + 0x3E)
+#define PSMSAMPLE_defvol(p)     ((p)[0x44])
+#define PSMSAMPLE_samplerate(p) LE32((p) + 0x49)
+
+BOOL CSoundFile::ReadPSM(LPCBYTE lpStream, DWORD dwMemLength)
+//-----------------------------------------------------------
+// Fixed for big-endian / strict-alignment platforms (IRIX/MIPS).
+{
+    DWORD dwMemPos, dwSongPos;
+    DWORD patptrs[MAX_PATTERNS];
+    BYTE  samplemap[MAX_SAMPLES];
+    UINT  nPatterns;
+
+    if (dwMemLength < 256) return FALSE;
+
+    // --- Chunk 0 header ---
+    if (dwMemLength < 12) return FALSE;
+    DWORD chunk0_id     = PSMCHUNK_id(lpStream);
+    DWORD chunk0_len    = PSMCHUNK_len(lpStream);
+    DWORD chunk0_listid = PSMCHUNK_listid(lpStream);
+
+    if (chunk0_id == PSM_ID_OLD)
+    {
+#ifdef PSM_LOG
+        Log("Old PSM format not supported\n");
+#endif
+        return FALSE;
+    }
+    if ((chunk0_id != PSM_ID_NEW) || (chunk0_len + 12 > dwMemLength) || (chunk0_listid != IFFID_FILE))
+        return FALSE;
+
+    m_nType     = MOD_TYPE_PSM;
+    m_nChannels = 16;
+    m_nSamples  = 0;
+    nPatterns   = 0;
+    dwMemPos    = 12;
+    dwSongPos   = 0;
+
+    for (UINT iChPan = 0; iChPan < 16; iChPan++)
+    {
+        UINT pan = (((iChPan & 3) == 1) || ((iChPan & 3) == 2)) ? 0xC0 : 0x40;
+        ChnSettings[iChPan].nPan = pan;
+    }
+
+    // -----------------------------------------------------------------------
+    // Pass 1: scan top-level chunks
+    // -----------------------------------------------------------------------
+    while (dwMemPos + 8 < dwMemLength)
+    {
+        const BYTE *pchunkbase = lpStream + dwMemPos;
+        DWORD cid  = PSMCHUNK_id(pchunkbase);
+        DWORD clen = PSMCHUNK_len(pchunkbase);
+
+        if ((clen >= dwMemLength - 8) || (dwMemPos + clen + 8 > dwMemLength)) break;
+        dwMemPos += 8;
+
+        const BYTE *pdata = lpStream + dwMemPos;
+        ULONG len = clen;
+
+        if (len) switch (cid)
+        {
+        // "TITL": Song title
+        case IFFID_TITL:
+            if (!pdata[0]) { pdata++; len--; }
+            memcpy(m_szNames[0], pdata, (len > 31) ? 31 : len);
+            m_szNames[0][31] = 0;
+            break;
+
+        // "PBOD": Pattern — record stream position for pass 2
+        case IFFID_PBOD:
+            if ((len >= 12) && (nPatterns < MAX_PATTERNS))
+                patptrs[nPatterns++] = dwMemPos - 8;
+            break;
+
+        // "SONG": Song description
+        case IFFID_SONG:
+            if ((len >= sizeof(PSMSONGHDR) + 8) && (!dwSongPos))
+                dwSongPos = dwMemPos - 8;
+            break;
+
+        // "DSMP": Sample data
+        case IFFID_DSMP:
+            if ((len >= 0x60) && (m_nSamples + 1 < MAX_SAMPLES))
+            {
+                m_nSamples++;
+                MODINSTRUMENT *pins = &Ins[m_nSamples];
+
+                // All fields read via macros — no struct cast, no swap call
+                memcpy(m_szNames[m_nSamples], PSMSAMPLE_samplename(pdata), 31);
+                m_szNames[m_nSamples][31] = 0;
+                samplemap[m_nSamples - 1] = (BYTE)m_nSamples;
+
+                pins->nGlobalVol = 0x40;
+                pins->nC4Speed   = PSMSAMPLE_samplerate(pdata);
+                pins->nLength    = PSMSAMPLE_length(pdata);
+                pins->nLoopStart = PSMSAMPLE_loopstart(pdata);
+                pins->nLoopEnd   = PSMSAMPLE_loopend(pdata);
+                pins->nPan       = 128;
+                pins->nVolume    = (PSMSAMPLE_defvol(pdata) + 1) * 2;
+                pins->uFlags     = (PSMSAMPLE_flags(pdata) & 0x80) ? CHN_LOOP : 0;
+                if (pins->nLoopStart > 0) pins->nLoopStart--;
+
+                // PCM data follows the fixed 0x60-byte header
+                const BYTE *sampledata = pdata + 0x60;
+                ULONG samplelen = (len > 0x60) ? (len - 0x60) : 0;
+                if ((pins->nLength > 3) && (samplelen > 3))
+                    ReadSample(pins, RS_PCM8D, (LPCSTR)sampledata, samplelen);
+                else
+                    pins->nLength = 0;
+            }
+            break;
+        }
+
+        dwMemPos += clen;
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 1: parse song header — channel count and order list
+    // -----------------------------------------------------------------------
+    if (!dwSongPos) return TRUE;
+
+    UINT songChannels = PSMSONGHDR_channels(lpStream + dwSongPos + 8);
+    if ((songChannels < 2) || (songChannels > 32)) return TRUE;
+    m_nChannels = songChannels;
+
+    {
+        DWORD dwSongEnd = dwSongPos + 8 + LE32(lpStream + dwSongPos + 4);
+        dwMemPos = dwSongPos + 8 + 11; // sizeof(PSMCHUNK) + sizeof(PSMSONGHDR)
+
+        while (dwMemPos + 8 < dwSongEnd)
+        {
+            const BYTE *pchunkbase = lpStream + dwMemPos;
+            DWORD cid  = PSMCHUNK_id(pchunkbase);
+            DWORD clen = PSMCHUNK_len(pchunkbase);
+
+            dwMemPos += 8;
+            if ((clen > dwSongEnd) || (dwMemPos + clen > dwSongEnd)) break;
+
+            const BYTE *pdata = lpStream + dwMemPos;
+            ULONG len = clen;
+
+            switch (cid)
+            {
+            case IFFID_OPLH:
+                if (len >= 0x20)
+                {
+                    UINT pos = len - 3;
+
+                    // Scan backwards for default speed/tempo
+                    while (pos > 5)
+                    {
+                        pos -= 5;
+                        DWORD dwName = LE32(pdata + pos);
+                        BOOL bFound = FALSE;
+                        for (UINT i = 0; i < nPatterns; i++)
+                        {
+                            if (dwName == LE32(lpStream + patptrs[i] + 12))
+                            {
+                                bFound = TRUE;
+                                break;
+                            }
+                        }
+                        if ((!bFound)
+                         && (pdata[pos + 1] > 0)    && (pdata[pos + 1] <= 0x10)
+                         && (pdata[pos + 3] > 0x40) && (pdata[pos + 3] <  0xC0))
+                        {
+                            m_nDefaultSpeed = pdata[pos + 1];
+                            m_nDefaultTempo = pdata[pos + 3];
+                            break;
+                        }
+                    }
+
+                    // Build order list
+                    UINT iOrd = 0;
+                    while ((pos + 5 < len) && (iOrd < MAX_ORDERS))
+                    {
+                        DWORD dwName = LE32(pdata + pos);
+                        for (UINT i = 0; i < nPatterns; i++)
+                        {
+                            if (dwName == LE32(lpStream + patptrs[i] + 12))
+                            {
+                                Order[iOrd++] = i;
+                                break;
+                            }
+                        }
+                        pos += 5;
+                    }
+                }
+                break;
+            }
+
+            dwMemPos += clen;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 2: convert patterns
+    // -----------------------------------------------------------------------
+    for (UINT nPat = 0; nPat < nPatterns; nPat++)
+    {
+        // Pattern chunk body starts 8 bytes in from the chunk base
+        const BYTE *patbody = lpStream + patptrs[nPat] + 8;
+
+        ULONG len   = LE32(lpStream + patptrs[nPat] + 4) - 12;
+        UINT  nRows = PSMPATTERN_rows(patbody);
+        ULONG size  = PSMPATTERN_size(patbody);
+
+        if (len > size) len = size;
+        if ((nRows < 64) || (nRows > 256)) nRows = 64;
+
+        PatternSize[nPat] = nRows;
+        if ((Patterns[nPat] = AllocatePattern(nRows, m_nChannels)) == NULL) break;
+
+        MODCOMMAND *m    = Patterns[nPat];
+        const BYTE *p    = PSMPATTERN_data(patbody);
+        MODCOMMAND  dummy;
+        UINT pos    = 0;
+        UINT row    = 0;
+        UINT rowlim = PSMPATTERN_reserved1(patbody) - 2;
+
+#ifdef PSM_LOG
+        Log("Pattern %d at offset 0x%04X\n", nPat, (DWORD)(p - lpStream));
+#endif
+
+        while ((row < nRows) && (pos + 3 < len))
+        {
+            if ((pos + 1) >= rowlim)
+            {
+                pos = rowlim;
+                rowlim = (UINT)p[pos] | ((UINT)p[pos + 1] << 8); // LE16, byte-safe
+                m += m_nChannels;
+                row++;
+                rowlim += pos;
+                pos += 2;
+            }
+            if (row >= nRows) continue;
+
+            UINT flags = p[pos++];
+            UINT ch    = p[pos++];
+            MODCOMMAND *sp = (ch < m_nChannels) ? &m[ch] : &dummy;
+
+            // Note
+            if ((flags & 0x80) && (pos + 1 < len))
+            {
+                UINT note = p[pos++];
+                note = (note >> 4) * 12 + (note & 0x0f) + 12 + 1;
+                if (note > 0x80) note = 0;
+                sp->note = (BYTE)note;
+            }
+            // Instrument
+            if ((flags & 0x40) && (pos + 1 < len))
+            {
+                UINT nins = p[pos++];
+#ifdef PSM_LOG
+                if ((!nPat) && (nins >= m_nSamples))
+                    Log("WARNING: invalid instrument number (%d)\n", nins);
+#endif
+                sp->instr = samplemap[nins];
+            }
+            // Volume
+            if ((flags & 0x20) && (pos < len))
+            {
+                sp->volcmd = VOLCMD_VOLUME;
+                sp->vol    = p[pos++] / 2;
+            }
+            // Effect
+            if ((flags & 0x10) && (pos + 1 < len))
+            {
+                UINT command = p[pos++];
+                UINT param   = p[pos++];
+
+                switch (command)
+                {
+                case 0x01: // fine volslide up
+                    command = CMD_VOLUMESLIDE;
+                    param |= 0x0f;
+                    if (param == 15) param = 31;
+                    break;
+                case 0x02: // volslide up
+                    command = CMD_VOLUMESLIDE;
+                    param >>= 1; param <<= 4;
+                    break;
+                case 0x03: // fine volslide down
+                    command = CMD_VOLUMESLIDE;
+                    param >>= 4; param |= 0xf0;
+                    if (param == 240) param = 241;
+                    break;
+                case 0x04: // volslide down
+                    command = CMD_VOLUMESLIDE;
+                    param >>= 4; param |= 0xf0;
+                    break;
+                case 0x0C: // portamento up
+                    command = CMD_PORTAMENTOUP;
+                    param = (param + 1) / 2;
+                    break;
+                case 0x0E: // portamento down
+                    command = CMD_PORTAMENTODOWN;
+                    param = (param + 1) / 2;
+                    break;
+                case 0x0F: // tone portamento
+                    command = CMD_TONEPORTAMENTO;
+                    param /= 4;
+                    break;
+                case 0x15: // vibrato
+                    command = CMD_VIBRATO;
+                    break;
+                case 0x29: // sample offset — skip 2 extra bytes, suppress effect
+                    pos += 2;
+                    command = param = 0;
+                    break;
+                case 0x2A: // retrigger
+                    command = CMD_RETRIG;
+                    break;
+                case 0x33: // position jump
+                    command = CMD_POSITIONJUMP;
+                    break;
+                case 0x34: // pattern break
+                    command = CMD_PATTERNBREAK;
+                    break;
+                case 0x3D: // speed
+                    command = CMD_SPEED;
+                    break;
+                case 0x3E: // tempo
+                    command = CMD_TEMPO;
+                    break;
+                default:
+#ifdef PSM_LOG
+                    Log("Unknown PSM effect pat=%d row=%d ch=%d: %02X.%02X\n",
+                        nPat, row, ch, command, param);
+#endif
+                    command = param = 0;
+                    break;
+                }
+
+                sp->command = (BYTE)command;
+                sp->param   = (BYTE)param;
+            }
+        }
+
+#ifdef PSM_LOG
+        if (pos < len)
+            Log("Pattern %d: %d/%d[%d] rows (%d bytes) -> %d bytes left\n",
+                nPat, row, nRows, (int)PSMPATTERN_rows(patbody), (int)size, (int)(len - pos));
+#endif
+    }
+
+    return TRUE;
+}
+#else
 BOOL CSoundFile::ReadPSM(LPCBYTE lpStream, DWORD dwMemLength)
 //-----------------------------------------------------------
 {
@@ -399,6 +783,7 @@ BOOL CSoundFile::ReadPSM(LPCBYTE lpStream, DWORD dwMemLength)
 	return TRUE;
 }
 
+#endif 
 
 //////////////////////////////////////////////////////////////
 //

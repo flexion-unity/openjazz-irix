@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.18...4.2)
+cmake_minimum_required(VERSION 3.17...4.0)
 
 project(OpenJazz
 	VERSION 20260218
@@ -16,6 +16,17 @@ include(Platform-Helpers)
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "IRIX" OR CMAKE_SYSTEM_NAME STREQUAL "IRIX64")
+  message(STATUS "IRIX detected!")
+  set(IRIX ON)
+  # SGUG-RSE IRIX GL fix
+
+  add_compile_options(-I/usr/sgug/lib/gcc/mips-sgi-irix6.5/9/include -I/usr/include -I/usr/sgug/include -I/usr/sgug/include/SDL -D_GNU_SOURCE=1 -D_SGI_MP_SOURCE)
+
+  #for SDL2 GL:
+  #add_link_options(/usr/lib32/libX11.so.1 /usr/lib32/libXext.a /usr/lib32/libXt.a /usr/lib32/libXm.so.1 /usr/lib32/libXpm.so.1 -lGLEW -lpthread -lm -Wl,--allow-shlib-undefined -Wl,-rpath-link=/usr/lib32 -Wl,-rpath=/usr/lib32:/usr/sgug/lib32)
+endif()
 
 # OpenJazz
 
@@ -160,6 +171,13 @@ elseif(LEGACY_SDL)
 	target_include_directories(OpenJazz PRIVATE ${SDL_INCLUDE_DIR})
 	target_link_libraries(OpenJazz ${SDL_LIBRARY})
 	set(SDL_STATUS "SDL1.2 (legacy)")
+elseif(IRIX)
+	message(STATUS "Compiling for IRIX big endian!")
+	find_package(SDL REQUIRED)
+	target_compile_definitions(OpenJazz PRIVATE OJ_SDL1)
+	target_include_directories(OpenJazz PRIVATE ${SDL_INCLUDE_DIR})
+	target_link_libraries(OpenJazz ${SDL_LIBRARY})
+	set(SDL_STATUS "SDL1.2 (legacy)")
 else()
 	set(SDL_VERSION "2" CACHE STRING "SDL Version to use (2 or 3")
 	set_property(CACHE SDL_VERSION PROPERTY STRINGS 2 3)
@@ -214,11 +232,15 @@ endif()
 # scaling
 
 set(SCALE_STATUS "Disabled")
-cmake_dependent_option(SCALE "Allow scaling" ON "OJ_ALLOW_SCALE" OFF)
+cmake_dependent_option(SCALE "Allow scaling" ON "OJ_ALLOW_SCALE;LEGACY_SDL" OFF)
 if(SCALE)
-	set(SCALE_STATUS "Enabled")
+	set(SCALE_STATUS "Enabled, scale2x")
 	target_compile_definitions(OpenJazz PRIVATE SCALE)
+	target_link_libraries(OpenJazz scale2x)
 	add_subdirectory(ext/scale2x)
+elseif(NOT LEGACY_SDL)
+	# FIXME: add codepath for gpu scaling
+	set(SCALE_STATUS "Disabled (currently broken in SDL2 port)")
 endif()
 
 option(ENABLE_JJ2 "Enable experimental Episode 2 support (not recommended)" OFF)
@@ -303,7 +325,8 @@ elseif(EMSCRIPTEN)
 	set_property(TARGET OpenJazz PROPERTY LINK_FLAGS
 		"--shell-file ${JS_SHELL} -sMINIFY_HTML=0 -flto --use-port=sdl2
 		 -sFORCE_FILESYSTEM -sEXIT_RUNTIME=1 -sASYNCIFY
-		 -sENVIRONMENT=web --closure 1 -sASSERTIONS -sNO_DISABLE_EXCEPTION_CATCHING")
+		 -sENVIRONMENT=web --closure 1 -sEXPORTED_RUNTIME_METHODS=['allocate']
+		 -sASSERTIONS -sNO_DISABLE_EXCEPTION_CATCHING")
 	set_source_files_properties("src/main.cpp" PROPERTIES OBJECT_DEPENDS "${JS_SHELL}")
 elseif(ANDROID)
 	target_sources(OpenJazz PRIVATE
@@ -503,25 +526,7 @@ else()
 endif()
 unset(MAN_PATH)
 
-# doxygen source documentation
-
-find_package(Doxygen)
-if(DOXYGEN_FOUND)
-	set(OJ_VERSION_DOX ${PROJECT_VERSION})
-	if(OJ_VERSION_GIT)
-		string(APPEND OJ_VERSION_DOX " (${OJ_VERSION_GIT})")
-	endif()
-	configure_file(res/doxygen/Doxyfile.in doc/Doxyfile @ONLY)
-	add_custom_target(doc
-		${DOXYGEN_EXECUTABLE} ${CMAKE_CURRENT_BINARY_DIR}/doc/Doxyfile
-		DEPENDS ${PROJECT_NAME}
-		WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/doc
-		COMMENT "Generating source documentation with Doxygen"
-		VERBATIM)
-endif()
-
 # Print short summary
-
 message(STATUS "")
 message(STATUS "OpenJazz")
 message(STATUS "========")
@@ -541,9 +546,6 @@ if(DATAPATH)
 endif()
 message(STATUS "Manual page: ${MANUAL_STATUS}")
 message(STATUS "Portable Engine: ${PORTABLE_STATUS}")
-if(DOXYGEN_FOUND)
-	message(STATUS "Source Documentation: doxygen")
-endif()
 message(STATUS "")
 message(STATUS "In case something goes wrong, report bugs to ${OJ_BUGREPORT}")
 message(STATUS "")
