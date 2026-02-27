@@ -64,6 +64,9 @@
 	#include <arpa/inet.h>
 #endif
 
+#ifdef __sgi
+#include <sys/time.h>
+#endif
 
 /**
  * Initialise networking.
